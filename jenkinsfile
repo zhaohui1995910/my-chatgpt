@@ -1,0 +1,136 @@
+node('jnlp') {
+  // 镜像仓库前缀
+  def NAMESPACE = "dangqu-powertrade"
+  def deploymentNamespace= "pt-api-test"
+  def serviceName= "ai-api"
+  def tag= "latest"
+  def SERVER_URL = "swr.cn-east-2.myhuaweicloud.com"
+  def full_image_name = ""
+  def FULL_ADDRESS = "${SERVER_URL}/${NAMESPACE}"
+  def DEPLOYMENT_NODE_IP = "192.168.125.144"
+  def DEPLOYMENT_NODE_SSH_PORT = "22"
+  def REGISTRY_AUTH_ID = 'gitlab-registry-auth'
+  def DEPLOY_SSH_AUTH_ID = 'k8s-deploy-ssh-auth'
+  
+  def buildId = ""
+  def skipDeploy = false
+
+
+  stage('code pull') {
+    waitUntil {
+      try{
+        buildId = currentBuild.number.toString()
+        echo buildId
+        echo ref
+        scmVars = checkout([
+            $class: 'GitSCM',
+            branches: [[name: ref]],
+            doGenerateSubmoduleConfigurations: scm.doGenerateSubmoduleConfigurations,
+            extensions: scm.extensions,
+            userRemoteConfigs: scm.userRemoteConfigs
+        ])
+        echo ref
+        if (  ref == "refs/heads/dev" ) {
+          tag = "latest"
+          DEPLOYMENT_NODE_IP="192.168.125.144"
+          deploymentNamespace="pt-api-dev"
+          SERVER_URL="registry.powertradepro.com"
+          NAMESPACE="container_group/images"
+		  REGISTRY_AUTH_ID = 'gitlab-registry-auth'
+        }
+        else if ( ref == "refs/heads/release"){
+          tag = "release"
+          DEPLOYMENT_NODE_IP = "192.168.125.152"
+          SERVER_URL="registry.powertradepro.com"
+          NAMESPACE="container_group/images"
+		  REGISTRY_AUTH_ID = 'gitlab-registry-auth'
+        }
+        else if ( ref.startsWith("refs/tags/")){
+          tag = ref.substring(10,ref.length())
+          echo tag
+          buildId="${tag}.${buildId}"
+          echo buildId
+          skipDeploy = true
+          SERVER_URL="swr.cn-east-3.myhuaweicloud.com"
+		  REGISTRY_AUTH_ID = 'huaweicloud-registry-auth'
+        }
+        else{
+          echo "not supported"
+        }
+        FULL_ADDRESS = "${SERVER_URL}/${NAMESPACE}"
+        script {
+          echo "pull successfully"
+        }   
+        true       
+      }catch(error){
+        echo "Retry"
+        false              
+      }
+    }
+  }
+  stage('docker login') {
+    waitUntil {
+      try{
+		withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: REGISTRY_AUTH_ID, usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD']]) {
+            script {
+                sh (returnStdout: false, script: "docker login --username=${USERNAME} --password=${PASSWORD} ${SERVER_URL}"  )
+            }
+        }
+        true    
+      }catch(error){
+        echo "Retry"
+        false 
+      }
+    }
+  }
+  stage('build in docker') {
+    script {
+      echo "begin build in docker"
+      echo buildId
+        full_image_name= "${FULL_ADDRESS}/${serviceName}:${tag}"
+        sh (returnStdout: false, script: "docker build  --build-arg buildId=${buildId} -f Dockerfile -t ${full_image_name} ." )
+      echo "end build in docker"
+    }      
+  }
+  stage('push to registry') {
+    if(skipDeploy){
+      echo "skip deploy"
+    }
+    waitUntil {
+      try{
+        script {
+          echo "begin push to registry"
+
+          sh (returnStdout: false, script: "docker push ${full_image_name}"  )
+          
+          echo "end push to huawei yun registry"
+        }    
+        true
+      }catch(error){
+        echo "Retry"
+        false       
+      }  
+    }  
+  }
+  stage('deployment') {
+    waitUntil {
+      try{
+		withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: DEPLOY_SSH_AUTH_ID, usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD']]) {
+            script {
+              echo "begin deployment by ssh"
+              def scripts="sshpass -p '${PASSWORD}' ssh -o StrictHostKeyChecking=no ${USERNAME}@${DEPLOYMENT_NODE_IP} 'kubectl --insecure-skip-tls-verify -n ${deploymentNamespace} set env deployments ${serviceName} build_version=${buildId}' "
+              sh (returnStdout: false, script: scripts  )
+
+              echo "end deployment by ssh"
+            }
+          }
+		  
+        true
+      }
+	  catch(error){
+		echo "Retry"
+		false    
+	  } 
+    }        
+  }
+}
